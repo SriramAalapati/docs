@@ -1,0 +1,456 @@
+# Recovery Management CRM — Frontend Masterplan
+### Multi-Tenant, Role-Aware, Feature-Flagged Enterprise Dashboard
+**Version 1.0 — Reference document for engineering, design, and coding agents**
+
+---
+
+## 0. How to use this document
+
+This is the source of truth for **how we build UI** in this product. Every new component, page, or PR should be checked against Section 3 (Design System) and Section 5 (Engineering Rules) before merge. Section 8 is the week-by-week execution plan for the first 4 months, with the remaining 8 months at milestone-level.
+
+Treat this like a constitution, not a suggestion list. If a component violates a rule here, either the component changes or this document changes — never a silent exception.
+
+---
+
+## 1. Competitive Landscape — what "enterprise-grade" actually looks like
+
+Recovery/collections CRMs compete less on *features* (everyone has cases, payments, calls) and more on **operational trust**: does the tool feel like it was engineered by people who understand a collector's day, or does it feel like a CRUD admin panel with a logo?
+
+What the best-in-class B2B dashboards (Salesforce Financial Services Cloud, HubSpot, Linear, Stripe Dashboard, Vercel, Zendesk, Intercom, banking-grade NBFC platforms) share structurally:
+
+| Pattern | What it means in practice |
+|---|---|
+| **State survives navigation** | Filters, scroll position, selected tab, table sort — all restored exactly when the user comes back. This is non-negotiable per your brief and is a top-3 retention driver in operational tools. |
+| **Optimistic, instant-feeling UI** | Clicking "assign" updates the row immediately; the network call reconciles silently in the background. Failure rolls back with a toast, not a page reload. |
+| **Progressive disclosure of complexity** | A collector sees 5 things. An ops admin sees 40. Same codebase, different rendered surface — driven by RBAC + feature flags, not separate apps. |
+| **Real engineering under the hood** | WebSocket-driven live counters (not polling every 5s), skeletons that match final layout pixel-for-pixel (no layout shift), keyboard-first power tools (Cmd+K), URL as the API for state. |
+| **Trust signals** | Audit trails visible in-context, "who changed this and when" on hover, clear read-only vs. editable states rather than hiding buttons (see Section 4.4 on permission UX). |
+| **Never a dead end** | Every empty state, every 403, every "no data" screen tells the user what to do next or who to ask. |
+
+**What we will do better than typical collections CRMs (which tend to look like 2014 admin templates):**
+1. A **manifest-driven UI** — the entire nav, dashboard widgets, and available actions for a tenant/role are described by a JSON config from the backend, not hardcoded per role. This is what lets us onboard a new NBFC client with a different workflow *without shipping new frontend code*.
+2. **Permission-aware components by default** — every actionable element (button, menu item, field) is wrapped in a permission gate that either hides it, disables it with a tooltip ("Ask your Branch Manager"), or shows it — there is no fourth, ad-hoc state.
+3. **State restoration as a platform primitive**, not a per-page hack — one hook (`usePersistedView`) that every list/table page uses for filters + scroll + sort + pagination, backed by URL params first, sessionStorage second.
+
+---
+
+## 2. Core Architecture Decisions
+
+### 2.1 Tech stack (confirmed + recommended additions)
+
+| Layer | Choice | Why |
+|---|---|---|
+| Framework | React 18 + TypeScript (strict mode) | Given |
+| Routing | React Router v6.4+ (data routers) | Given — use loaders for prefetch, not just component-level fetching |
+| Server state / caching | **TanStack Query (React Query) v5** | Given — this owns all server data, caching, retries, background refetch |
+| Client/UI state | **Zustand** | Given — session, UI toggles, tenant manifest, ephemeral state only. Never duplicate server data in Zustand. |
+| URL state | **nuqs** | Type-safe, framework-agnostic (supports React Router) URL state manager. This is how filters, pagination, active tab, and sort survive navigation and are shareable/bookmarkable. Pairs cleanly with Zustand for state nuqs doesn't cover (e.g., scroll position, see 5.3). |
+| Styling | Tailwind CSS + design tokens (Section 3) | Given |
+| Component library | **Ant Design (AntD 5.x)** as the base component layer, themed via AntD's `ConfigProvider` + design tokens, Tailwind for layout/spacing utility only | AntD gives us production-grade Table, Form, Modal, DatePicker, Upload, Tree, Transfer out of the box — rebuilding these in raw Tailwind is a 6-month tax we don't need to pay. Tailwind stays for layout, spacing, one-off utility classes — **never** for reimplementing what AntD already does well. |
+| Permissions engine | **CASL** (`@casl/ability` + `@casl/react`) | Isomorphic (same rules can run on backend Node/NestJS and frontend), TypeScript-native, supports `can()`/`cannot()` checks against subject+action+field, and scales from simple RBAC to attribute-based rules (e.g., "collector can edit case only if assigned to them and DPD < 90") without a rewrite. |
+| Feature flags | **Unleash** (self-hosted or Unleash Cloud) | Open source, predictable per-seat pricing (not per-MAU), supports per-tenant/per-context targeting strategies, OpenFeature-compatible SDK, gives us kill-switches without redeploys. Alternative if budget allows a fully managed path: LaunchDarkly (stronger governance/SLA, materially higher cost at our scale). Recommendation: start on Unleash OSS self-hosted, revisit in Month 9 if we need enterprise governance features. |
+| Real-time | **Socket.IO** (or native WebSocket + a thin reconnect/backoff wrapper) with a single app-level connection manager | For live notification counts, case updates, payment events. React Query's `queryClient.setQueryData` is updated directly from socket events instead of refetching — this is what makes updates feel instant rather than "next poll." |
+| Forms | **React Hook Form + Zod** | Type-safe schema validation shared between form and API payload shape. |
+| HTTP layer | Single `apiCaller.ts` (see Section 6) built on `axios` with interceptors | Centralizes base URL, auth headers, tenant header injection, error normalization, toast dispatch. |
+| Auth | OAuth 2.0 / OIDC via a provider (Auth0, Keycloak, or WorkOS) + custom email/password + SSO (Google Workspace / Microsoft Entra ID for "sign in with company email") | See Section 7. |
+| Toasts / notifications | AntD `notification` / `message` API, wrapped in our own `notify.ts` helper for consistent intelligent behavior (dedupe, severity mapping, action buttons, undo) | |
+| Tables at scale | AntD Table + `@tanstack/react-virtual` for row virtualization on large datasets | Needed for the "infinite scroll / virtualized tables for large datasets" requirement — AntD's table alone will choke past a few thousand rows without virtualization. |
+| Charts | Recharts (dashboards, funnels, aging buckets) | Lightweight, composable, good AntD visual pairing. |
+| Testing | Vitest + React Testing Library + Playwright (E2E) | Not explicitly asked but required for a codebase multiple agents will touch — untested permission logic in a financial product is a liability. |
+| Monorepo tooling | Turborepo or Nx, pnpm workspaces | If web + future mobile/admin surfaces are planned; otherwise a single Vite app is fine for Month 1–4. |
+
+### 2.2 Why CASL over rolling our own RBAC
+
+You asked specifically for a TypeScript package to manage roles/policies/permissions. CASL is the right call because:
+- It expresses rules as `can(action, subject, conditions)` — this maps directly to your requirement ("collector can edit case IF assigned to them AND DPD < 90"), which plain role-string checks (`if (role === 'admin')`) cannot express without turning into unmaintainable spaghetti.
+- It's **isomorphic** — the same ability rules (or rules derived from the same backend policy source) can be evaluated on the server for API enforcement and on the client for UI gating, keeping "hide the button" and "reject the request" in sync.
+- `@casl/react` ships a `<Can>` component and `useAbility()` hook — exactly the primitive we need for Section 4.4 (permission-aware buttons).
+- It avoids "role explosion" — the common failure mode where every new customer requirement spawns a new named role. We define **permissions**, and tenants assemble roles by composing permission sets on the backend (see 4.1).
+
+### 2.3 Manifest-driven, multi-tenant frontend
+
+The frontend never hardcodes "if tenant === X, show Y." Instead, on login (or tenant resolution via subdomain/custom domain), the backend returns a **Tenant Manifest**:
+
+```ts
+interface TenantManifest {
+  tenantId: string;
+  branding: {
+    logoUrl: string;
+    primaryColor: string;   // mapped into our design tokens, not raw override of every component
+    productName: string;    // white-label support
+  };
+  featureFlags: Record<string, boolean>;         // resolved server-side via Unleash, per tenant+user context
+  navigation: NavItem[];                          // ordered, role-filtered nav tree
+  workflowConfig: {
+    statusTransitions: WorkflowGraph;              // e.g., allowed case status transitions per org
+    approvalRules: ApprovalRule[];
+  };
+  permissions: RawCaslRule[];                      // resolved for the current user, fed into CASL's ability builder
+  locale: { language: string; currency: string; timezone: string };
+}
+```
+
+This manifest is fetched once per session (cached in React Query with a long staleTime, invalidated on role/permission change via a socket event), stored in a Zustand `useTenantStore`, and is what every gated component, nav render, and feature-flag check reads from. **No component should ever import a hardcoded tenant ID or role name.**
+
+---
+
+## 3. Design System — Layout, Spacing, Typography, Color, Motion
+
+This section is the literal style guide every agent/developer must follow. Deviating requires a documented exception in the PR description.
+
+### 3.1 Design tokens (source of truth, not duplicated per component)
+
+```ts
+// tokens.ts — feeds both Tailwind config and AntD ConfigProvider theme
+export const tokens = {
+  color: {
+    primary: '#2F5CDB',        // tenant-overridable within an approved palette range
+    primaryHover: '#254AAF',
+    success: '#12A150',
+    warning: '#D68A0C',
+    danger: '#D93F3F',
+    neutral: {
+      0: '#FFFFFF', 50: '#F7F8FA', 100: '#EEF0F3', 200: '#E2E5EA',
+      400: '#9AA2AF', 600: '#5B6472', 800: '#2C313A', 900: '#12141A',
+    },
+    statusBadge: {
+      current: '#12A150', dpd30: '#D68A0C', dpd60: '#E8622C',
+      dpd90plus: '#D93F3F', settled: '#5B6472', legal: '#7A2FD9',
+    },
+  },
+  spacing: [0, 4, 8, 12, 16, 20, 24, 32, 40, 48, 64], // 4px base unit — every margin/padding is one of these, no arbitrary values
+  radius: { sm: 4, md: 8, lg: 12, pill: 999 },
+  shadow: {
+    sm: '0 1px 2px rgba(16,20,30,0.06)',
+    md: '0 4px 12px rgba(16,20,30,0.08)',
+    lg: '0 12px 32px rgba(16,20,30,0.12)',
+  },
+  font: {
+    family: `'Inter', -apple-system, 'Segoe UI', sans-serif`,
+    mono: `'JetBrains Mono', monospace`, // for IDs, amounts, case numbers
+  },
+} as const;
+```
+
+### 3.2 Typography scale (strict — no ad hoc font sizes)
+
+| Token | Size / Line-height | Weight | Usage |
+|---|---|---|---|
+| `display` | 28px / 36px | 600 | Page-level headers only ("Cases", "Collector Dashboard") — one per page, max |
+| `h1` | 22px / 30px | 600 | Section headers within a page |
+| `h2` | 17px / 24px | 600 | Card titles, panel headers |
+| `body` | 14px / 22px | 400 | Default text, table cells, form labels |
+| `bodyStrong` | 14px / 22px | 600 | Emphasis within body text, key-value labels |
+| `caption` | 12px / 18px | 400 | Timestamps, helper text, metadata |
+| `overline` | 11px / 16px | 600, uppercase, +0.04em tracking | Section eyebrows, badge labels |
+
+Rules:
+- Never hardcode `font-size` in a component — always reference a typography token/utility class.
+- Numbers that matter operationally (amounts, DPD, case IDs) use `font-mono` + `tabular-nums` so columns align.
+- Max 2 font weights visible on a single screen at once (regular + semibold). No light weights on body text — accessibility.
+
+### 3.3 Spacing & layout grid
+
+- **4px base unit.** All padding/margin/gap values come from the `spacing` scale in 3.1. No `p-[13px]`, ever.
+- **App shell:** persistent left sidebar (240px expanded / 64px collapsed) + top bar (56px height, houses global search, notification bell, tenant switcher if user belongs to multiple tenants, avatar menu).
+- **Content max-width:** 1440px for data-dense pages (tables, dashboards); forms/detail panels cap at 720–860px for readability.
+- **Card padding:** 20px (desktop), 16px (mobile/tablet breakpoint).
+- **Table row height:** 44px default density, 36px "compact" density (user-toggleable, persisted per-user — see 5.3).
+- **Grid:** 12-column, 24px gutter for dashboard widget layouts (drag-resizable widgets use this grid).
+
+### 3.4 Color usage rules
+
+- Primary color: interactive elements only (primary buttons, active nav item, links, focus rings). Never large background fills.
+- Status colors (`statusBadge.*`) are **reserved** for DPD/case-status semantics — do not reuse `danger` red for generic destructive UI if it visually conflicts with a "DPD 90+" badge on the same screen; use a distinct destructive-action color if needed, or confirm via design review.
+- Every color pairing must meet WCAG AA contrast (4.5:1 text, 3:1 large text/icons) — this is a hard gate for financial-sector clients (accessibility audits are common in RFPs).
+- Dark mode is a Month-7 deliverable, not Month-1 — but tokens must be structured (semantic names, not raw hex, in components) from day one so dark mode is a token-swap, not a rewrite.
+
+### 3.5 Component conventions
+
+- **Buttons:** Primary (filled) — one per view/section max. Secondary (outlined). Tertiary (text/link-style) for low-emphasis actions. Destructive actions always require a confirmation dialog (AntD `Modal.confirm` styled per our tokens) — never a bare irreversible click.
+- **Modals:** Use for focused single tasks (create case, confirm settlement). Max width 560px for forms, 720px for content-heavy. Never stack more than 2 modals. Always trap focus, close on Esc, and show unsaved-changes warning if dirty (ties to the "Unsaved Changes Warning" feature from your reference doc).
+- **Tooltips:** 200ms open delay, instant close. Used for: truncated text, icon-only buttons, disabled-permission explanations (see 4.4), field help text. Never used to hide information the user needs to complete a task — that's a label, not a tooltip.
+- **Toasts (notify.ts):** Bottom-right, max 3 stacked, auto-dismiss 4s (5s+ for anything with an action/undo). Severity-coded (success/info/warning/error) with consistent iconography. Destructive-action toasts include "Undo" where the action is reversible within a short window (soft delete pattern).
+- **Empty states:** Illustration or icon + one-line explanation + one primary action ("No cases assigned yet — Ask your manager to assign cases" for a collector; "No cases match your filters — Clear filters" for a filtered table).
+- **Skeletons, not spinners,** for any content taking >200ms, and the skeleton must match the real layout's grid/row structure so there's zero layout shift on load.
+
+### 3.6 Motion
+
+- Standard transition: 150ms ease-out for hover/focus states, 200–250ms for panel/drawer slide-ins, 120ms for toasts.
+- No motion should block interaction — optimistic UI updates happen instantly; the animation is decorative, not load-bearing.
+- Respect `prefers-reduced-motion`.
+
+---
+
+## 4. Roles, Permissions & the Manifest-Driven Nav
+
+### 4.1 Permission model
+
+Backend is the source of truth. Structure:
+
+```
+Organization (tenant)
+ └─ Roles (tenant-defined, e.g., "Branch Collector", "Regional Manager" — names are tenant-customizable)
+     └─ Permission Sets (our fixed vocabulary: case.view, case.edit, case.assign,
+         case.delete, payment.record, payment.approve, settlement.propose,
+         settlement.approve, report.export, user.manage, workflow.configure, ...)
+         └─ Conditions (ABAC layer via CASL: ownership, branch scope, DPD range, amount threshold)
+```
+
+Tenants compose roles from our fixed permission vocabulary + conditions via an admin UI (Month 5 deliverable) — they don't get arbitrary code-level roles. This keeps the frontend permission surface bounded and testable.
+
+### 4.2 Baseline roles (every tenant starts with these; tenants can rename/extend)
+
+| Role | Sees | Can do | Cannot do |
+|---|---|---|---|
+| **Org Admin** | Everything across the org | User management, role/permission config, workflow builder, feature-flag visibility for their org, billing (if applicable), full audit log | Cross-tenant access (never, under any role) |
+| **Branch / Regional Manager** | Their branch's cases, collectors, dashboards | Assign/reassign cases, approve settlements up to threshold, view team performance, escalate | Global org settings, other branches' data (unless explicitly scoped) |
+| **Collector / Agent** | Only assigned cases, their own performance | Log calls/visits, record PTPs, request settlement (not approve), update contact attempts | Approve own settlements, see other collectors' cases, delete records |
+| **Compliance / Auditor** | Read-only across scoped data + full audit trail | Export reports, flag anomalies, view every audit log entry | Edit any operational record |
+| **Client / External Portal User** (if applicable) | Only their own case(s)/account | View balance, make payment, message assigned collector | See internal notes, other customers' data, internal workflow state |
+
+### 4.3 Nav bar as manifest output
+
+The sidebar renders directly from `manifest.navigation`, filtered at render time by `ability.can('view', navItem.subject)`. A nav item disappears entirely (not greyed out) if the role has zero access to that subject area — a collector never sees "Workflow Configuration" in the DOM at all, not even hidden via CSS (security-by-obscurity matters here: don't ship admin routes' data-fetching code paths to a collector's bundle either — use route-level code splitting keyed to permission groups).
+
+### 4.4 Permission-aware component pattern (the "why can't I click this" problem, solved)
+
+Every actionable element uses one shared primitive:
+
+```tsx
+<PermissionGate action="edit" subject="case" data={caseRecord}>
+  <Button>Edit Case</Button>
+</PermissionGate>
+```
+
+Behavior contract (this is the actual UX spec, not just code):
+- **Allowed:** renders normally.
+- **Not allowed, and the reason is role-based:** button renders **disabled**, not hidden, with a tooltip: *"You don't have edit rights for this. Contact your [Branch Manager / Org Admin] to request access."* — the bracketed role is dynamically resolved from the tenant's role hierarchy, so the user is told *who* to ask, not just "access denied."
+- **Not allowed, and the feature is entirely unavailable for this tenant (feature flag off):** the element does not render at all — this is a packaging/entitlement boundary, not a permission boundary, and should never look like "ask someone" (there's no one to ask; the org hasn't purchased/enabled it).
+- **Not allowed, and it's a genuinely hidden subject area (e.g., collector viewing another branch):** hidden entirely, same as nav — no information disclosure about the existence of the record.
+
+This three-way distinction (disabled-with-reason vs. absent-flag vs. absent-scope) is what separates a professional permission UX from the generic "everything either shows or 403s" pattern most CRUD tools ship.
+
+---
+
+## 5. Engineering Rules for State, Persistence & Realtime
+
+### 5.1 Filters, pagination, sort, active tab → URL (via `nuqs`)
+
+Every list/table view's filter state, page number, page size, sort column/direction, and active tab lives in the URL query string, not component state. This gives us for free: shareable/bookmarkable views, correct behavior on browser back/forward, and — critically for your requirement — **filters surviving navigation away and back**, because the URL doesn't change when the user opens a case and returns via back button.
+
+### 5.2 Scroll position restoration
+
+`nuqs`/URL doesn't cover scroll position. Implement a small `useScrollRestoration(key)` hook using `sessionStorage`, keyed by route + query string hash, that:
+1. Saves `window.scrollY` (or the virtualized table's scroll offset) on unmount/navigation-away, debounced.
+2. Restores it on remount **after** data has loaded (not before — restoring scroll into an empty skeleton list is the #1 cause of "it doesn't actually work" bugs in this pattern).
+
+This is genuinely one of the more finicky pieces of enterprise dashboard engineering — budget real QA time for it (Week 7, Section 8).
+
+### 5.3 User-level UI preferences (density, column visibility/order, pinned filters, theme)
+
+These are **not** shareable via URL (they're personal, not view-specific) and are **not** critical enough to round-trip to the backend on every toggle. Store in `localStorage`, namespaced per user+tenant (`crm:{tenantId}:{userId}:tablePrefs:{tableId}`), and **sync to backend asynchronously** (debounced) so preferences follow the user across devices — localStorage is the fast local cache, backend is the durable source. This matches your note about using localStorage for "contents" while being explicit that auth tokens do not belong there (5.4).
+
+### 5.4 Auth token storage — security requirement, not a style preference
+
+You mentioned storing tokens in cookies — confirming and tightening this:
+- **Access token:** short-lived (10–15 min), kept in memory (a Zustand slice, not persisted) to minimize XSS exposure window.
+- **Refresh token:** `httpOnly`, `Secure`, `SameSite=Strict` cookie, never accessible to JS. This is the actual security-correct pattern — refresh tokens must never sit in `localStorage`, where any XSS payload can read them.
+- Silent refresh handled inside `apiCaller.ts`'s response interceptor (see Section 6) on a 401, with a request queue so concurrent requests don't each trigger their own refresh race.
+- CSRF protection on the refresh endpoint via double-submit cookie pattern, since it's cookie-based.
+
+### 5.5 Real-time updates
+
+- Single Socket.IO connection per session, established after auth, scoped to the tenant + user's permission set (server only emits events the user is authorized to see — never filter sensitive events client-side only).
+- Incoming events update the React Query cache directly (`queryClient.setQueryData`) for entities already loaded, and increment counters (notification bell, "3 new cases assigned") without a full refetch.
+- Reconnect with exponential backoff; show a subtle "Reconnecting..." indicator in the top bar if the socket drops, never a blocking modal.
+
+---
+
+## 6. `apiCaller.ts` — single source of truth for API access
+
+Design contract (build this in Week 1):
+
+```ts
+// apiCaller.ts
+// - One axios instance, base URL from env/tenant config
+// - Request interceptor: attach access token, attach X-Tenant-Id, attach request-id for tracing
+// - Response interceptor: normalize error shape, handle 401 → silent refresh → retry once,
+//   handle 403 → do NOT toast generically; let caller decide (often it's an expected
+//   permission-boundary response the UI already prevented via PermissionGate, so a toast
+//   here would be redundant noise)
+// - Intelligent toast dispatch: network errors → "Connection issue, retrying..." (only after
+//   N failed retries, not on the first blip), 5xx → generic "Something went wrong, our team
+//   has been notified" + Sentry capture, 4xx validation errors → surfaced inline on the form,
+//   NOT as a toast (toasts for field errors are a well-documented anti-pattern — the user
+//   can't act on a toast that's already gone by the time they look at the field)
+// - Every call goes through typed wrapper functions per resource (casesApi.get(), 
+//   paymentsApi.record(), etc.) — no raw axios calls scattered in components
+// - Automatic request cancellation on component unmount / query key change (React Query
+//   handles this if apiCaller respects AbortSignal)
+```
+
+Toast intelligence rules (answering your "intelligently" requirement directly):
+- **Never toast a validation error** — inline field errors only.
+- **Never toast on component-level permission blocks** — the UI already told the user via the disabled-button tooltip pattern (4.4); a toast on top is redundant.
+- **Do toast:** successful mutations with undo where reversible, background sync failures the user wouldn't otherwise notice, real-time events relevant to the current view ("New case assigned to you"), session/connectivity state changes.
+- **Debounce/dedupe:** identical error toasts within a 5s window collapse into one, not a stack of five.
+
+---
+
+## 7. Authentication & Security
+
+- **Sign-in methods (Month 2–3 deliverable):**
+  1. Email + password (with strong password policy, breach-check via HaveIBeenPwned range API at signup/reset).
+  2. OAuth 2.0 / OIDC "Sign in with company email" — Google Workspace and Microsoft Entra ID as first-class SSO providers, since these cover the vast majority of enterprise/NBFC email domains.
+  3. SAML SSO for large enterprise clients who require it (Month 6+, on-demand per contract — this is usually a sales-driven, not universal, requirement).
+- **MFA:** TOTP-based 2FA (Section reference: "Two-factor authentication" from your feature list), enforceable **per tenant policy** (org admin can mandate MFA for all users).
+- **Session management:** device/session list per user ("Device login history," from your reference doc), ability to revoke sessions remotely, IP-based login restriction as an optional org policy.
+- **Recommendation:** don't hand-roll OAuth/OIDC. Use a managed identity provider (Auth0, WorkOS, or self-hosted Keycloak) behind our own login UI — this buys SOC2-relevant auth infrastructure, MFA, breach detection, and SSO connectors without building/maintaining them ourselves. WorkOS specifically is priced well for B2B SSO-per-tenant scenarios if enterprise SSO is a frequent client requirement.
+- **Data masking:** PII fields (phone, ID numbers) masked by default in list views, revealed on explicit user action (logged in audit trail) — ties to your "Data masking for sensitive information" enterprise feature.
+
+---
+
+## 8. Roadmap — 12 Months
+
+### Phase 1 (Months 1–4): Foundation + MVP dashboard — detailed week-by-week
+### Phase 2 (Months 5–8): Workflow engine, advanced RBAC UI, mobile-responsive polish, portal
+### Phase 3 (Months 9–12): Enterprise hardening, AI-assisted collection tooling, white-label, scale
+
+---
+
+### MONTH 1 — Platform Foundation (no user-facing features yet; this is the part that prevents 6 months of rework)
+
+**Week 1**
+- Repo scaffolding: Vite + React + TS strict, ESLint/Prettier, Tailwind config wired to design tokens (3.1), commit hooks (Husky + lint-staged).
+- `apiCaller.ts` v1 (Section 6) with interceptors, error normalization, request-id tracing.
+- Auth shell: login page (email/password only for now), token storage per 5.4, protected route wrapper.
+- CI pipeline: type-check, lint, unit test gate on every PR.
+
+**Week 2**
+- Tenant resolution + Tenant Manifest fetch/cache (Section 2.3), `useTenantStore` (Zustand).
+- CASL integration: `AbilityProvider`, `useAbility()`, `<PermissionGate>` primitive (4.4) with the three-way behavior contract built and unit-tested against fixtures for all 5 baseline roles.
+- App shell layout: sidebar (manifest-driven, empty nav for now), top bar, content region, responsive breakpoints.
+
+**Week 3**
+- `nuqs` integration + `usePersistedView` hook (filters/sort/pagination in URL).
+- `useScrollRestoration` hook (5.2) — build and test against a stub list page.
+- AntD theme wired to design tokens via `ConfigProvider` (colors, radius, font).
+- `notify.ts` toast wrapper (Section 6 rules) built and documented.
+
+**Week 4**
+- Feature flag SDK integration (Unleash client), `useFeatureFlag(key)` hook, flags visible in manifest.
+- Socket.IO connection manager (connect/reconnect/backoff), notification bell shell wired to a live counter (dummy events for now).
+- **Milestone demo:** empty shell app that logs in, resolves tenant, shows a permission-filtered nav, and survives a hard refresh with all state intact. This is boring by design — it's the chassis.
+
+### MONTH 2 — Core Case Management (the primary workflow)
+
+**Week 5**
+- Case list page: AntD Table + virtualization, columns per 3.5, filters (DPD bucket, branch, collector, status) all URL-backed.
+- Global search shell (Cmd/Ctrl+K palette) — searches cases/customers only for now.
+- Column customization (show/hide/reorder) persisted per 5.3.
+
+**Week 6**
+- Case detail page: activity timeline, tabs (Overview / Payments / Communication / Documents), all tab state URL-backed.
+- `<PermissionGate>` applied throughout case detail (edit, assign, delete actions) using real role fixtures.
+- Inline editing on key fields with optimistic updates + rollback-on-failure toast.
+
+**Week 7**
+- Payment recording flow (form via RHF + Zod), settlement proposal flow (collector) vs. approval flow (manager) — first real use of workflow status transitions from the manifest.
+- **Scroll + filter restoration QA pass** (this is the week to stress-test 5.1/5.2 — go back and forth between list and detail 50 times, on slow 3G throttle, and confirm zero regressions).
+
+**Week 8**
+- Audit log component (per-record "who changed what, when" — hover + full log tab).
+- Bulk actions (assign, export) on the case list with confirmation dialogs.
+- **Milestone demo:** a collector and a manager can each log in, see role-appropriate case lists, take role-appropriate actions, and every piece of state survives navigation.
+
+### MONTH 3 — Dashboards, Notifications, Real-Time
+
+**Week 9**
+- Role-based dashboard shells (Admin / Manager / Collector — three distinct widget sets) using a drag-resizable 12-col grid (3.3).
+- Widget library v1: aging-bucket funnel, DPD heatmap, collector leaderboard, daily call targets vs. actual, PTP tracker summary.
+
+**Week 10**
+- Notification Center (in-app panel, not just the bell counter) — real-time via socket events, mark-as-read, deep-link to the relevant case.
+- Real-time case list updates (new assignment appears live without refresh, per 5.5).
+
+**Week 11**
+- Recently Viewed + Favorites/Pinning (customers, cases, saved filters).
+- Saved filters UI ("save this filter combination as 'My Overdue 60+'").
+- Empty states + skeletons audit across every screen built so far (3.5 compliance pass).
+
+**Week 12**
+- Reporting/export (CSV/Excel) on case list and dashboard widgets.
+- Performance pass: bundle-size audit, route-level code splitting by permission group (4.3), Lighthouse targets (LCP < 2.5s, TTI < 3.5s on a mid-tier device profile).
+- **Milestone demo (end of Month 3):** all three baseline roles have a working, real-time, personalized dashboard and case workflow. This is a legitimate internal alpha.
+
+### MONTH 4 — Hardening, Second Auth Method, Client Portal Shell, Design QA
+
+**Week 13**
+- OAuth2/OIDC "Sign in with company email" (Google Workspace + Microsoft Entra ID) added alongside email/password (Section 7).
+- MFA (TOTP) implementation, org-level MFA enforcement policy.
+
+**Week 14**
+- Session/device management screen, IP restriction policy (admin-configurable).
+- Data masking for PII fields (phone/ID) with reveal-on-action + audit logging.
+
+**Week 15**
+- Client/External Portal shell (read-only account view, payment initiation, message thread with assigned collector) — scoped, separate route bundle, minimal nav.
+- Accessibility audit (WCAG AA) across all Phase 1 screens — contrast, keyboard nav, screen-reader labels.
+
+**Week 16**
+- Full regression + E2E suite (Playwright) covering: login (all 3 methods), permission gating for all 5 roles, filter/scroll persistence, real-time updates, bulk actions.
+- Design QA pass against Section 3 (typography, spacing, color) — fix every deviation found.
+- **Milestone demo (end of Month 4 / go-to-market checkpoint):** production-candidate build. This is what you'd put in front of a design-partner NBFC client for a paid pilot.
+
+---
+
+### MONTHS 5–6: Workflow Engine & Admin Configurability
+- No-code workflow builder UI (status transitions, approval chains) — this is what lets Org Admins configure their own case lifecycle without engineering involvement, fulfilling your "workflows" requirement at the configuration layer, not just the execution layer.
+- Role/permission builder UI (compose roles from the fixed permission vocabulary + conditions, per 4.1) — this is where tenants stop needing us to hand-configure their org.
+- SLA tracking + breach alerts, escalation rules.
+- Approval workflow UI (settlement approval chains with configurable thresholds).
+- Branch/region hierarchy management screens.
+
+### MONTHS 7–8: Polish, Scale, Mobile
+- Dark mode (token swap, per 3.4).
+- Full responsive/mobile-optimized layouts for collector-facing screens (field collectors are often on phones/tablets).
+- Command palette v2 (full app-wide actions, not just search).
+- Localization framework (language, currency, timezone) wired through the manifest.
+- Performance: virtualization audit on all large tables, image/document preview lazy-loading, CDN strategy for tenant branding assets.
+- Load testing the real-time layer at target concurrent-user scale.
+
+### MONTHS 9–10: Enterprise Hardening & Compliance
+- SAML SSO for enterprise clients requiring it.
+- Full audit log export + compliance reporting suite (Auditor role becomes fully self-serve).
+- Field-level permission matrix (beyond record-level — e.g., a manager can see a case but not the customer's national ID field).
+- SOC2-relevant controls: session timeout policies, password policy enforcement, security event logging surfaced in-app.
+- Feature-flag governance UI (which flags are on for which tenant, staged rollout support) if Unleash's own UI isn't sufficient for our internal ops team.
+
+### MONTHS 11–12: White-Label, AI-Assist, Market Expansion
+- Full white-label theming (tenant logo, color, product name across every surface, including client portal and emails).
+- AI-assisted features layered on top of the existing data (next-best-action suggestions for collectors, risk-score explanations, auto-drafted settlement notes) — additive, behind feature flags, opt-in per tenant.
+- Multi-tenant admin console for our own internal ops (provisioning new tenants, monitoring flag rollouts, usage analytics).
+- Public API + webhook layer for enterprise clients wanting to integrate the CRM into their own systems (ties to your "API keys and webhooks" enterprise feature).
+
+---
+
+## 9. Definition of Done (applies to every feature, every sprint)
+
+A feature is not done until:
+1. It's gated correctly for all affected roles (verified against CASL fixtures, not just "looks right for admin").
+2. It respects feature-flag absence (renders nothing broken if the flag is off for a tenant).
+3. Filters/sort/pagination/tab state (if applicable) are URL-backed and scroll-restoration-tested.
+4. It matches Section 3 tokens exactly — no inline arbitrary spacing/color/font values.
+5. Loading state is a skeleton matching final layout; error state has a real message and a next action; empty state has a next action.
+6. Toasts follow the intelligent-toast rules (Section 6) — no validation-error toasts, no redundant permission toasts.
+7. It has a Playwright test covering the primary happy path and the primary permission-denied path.
+
+---
+
+## 10. Open decisions to confirm with you before Month 1 kickoff
+
+- Identity provider choice: Auth0 vs. WorkOS vs. self-hosted Keycloak — cost/control tradeoff, needs a decision by Week 1.
+- Unleash self-hosted vs. Unleash Cloud — infra ownership tradeoff.
+- Whether Month 4's Client Portal ships as part of the same app (route-split) or a fully separate deployable — affects Month 4 scope.
+- Monorepo (Turborepo/Nx) now vs. later — only worth the setup cost if a second frontend surface (mobile, dedicated portal) is confirmed within the 12-month window.
